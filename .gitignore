@@ -54,3 +54,6 @@ build/ios/ipa
 
 # Generated Windows PE resources (goversioninfo, per-arch, made in CI)
 *.syso
+
+# Python bytecode (integrations/hermes tests)
+__pycache__/

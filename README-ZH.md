@@ -234,6 +234,12 @@ thefeed-server ... --chat-domains c.example.com     # 或 THEFEED_CHAT_DOMAINS=c
 
 在客户端从底部导航栏打开 **Chat**。✓ = 已存到服务器，✓✓ = 对方已取走；两台设备上的安全表情一致即表示会话安全。
 
+### AI 助手桥接（Hermes）
+
+[`integrations/hermes/`](integrations/hermes/) 让你通过私信通道与 [Hermes](https://github.com/NousResearch/hermes-agent) AI 智能体聊天，断网时也能联系到它。它是一个 Hermes 技能：把这个文件夹交给你的智能体，它会自行完成配置。它只读取来自你自己地址的消息；陌生人发来的消息既不会得到回复，也不会展示给模型。
+
+请在**你自己的 thefeed 服务器**上运行它：桥接程序会全天候轮询，而应用内置的共享默认服务器是给人用的，不是给机器人用的。如果你没有自己的服务器，默认配置也可以使用。
+
 ---
 
 <a id="how-it-works"></a>

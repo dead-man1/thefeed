@@ -230,6 +230,12 @@ thefeed-server ... --chat-domains c.example.com     # or THEFEED_CHAT_DOMAINS=c.
 
 In the client, open **Chat** from the bottom nav. ✓ = stored on the server, ✓✓ = picked up by the recipient; matching safety emojis on both devices confirm the conversation is secure.
 
+### AI assistant bridge (Hermes)
+
+[`integrations/hermes/`](integrations/hermes/) lets you chat with a [Hermes](https://github.com/NousResearch/hermes-agent) AI agent over the messenger, so it stays reachable when the internet is cut. It is a Hermes skill: give your agent the folder and it sets itself up. It only ever reads messages from your own address. Strangers who write to it are never answered or shown to the model.
+
+Please run it against **your own thefeed server**: a bridge polls around the clock, and the shared default servers built into the app are meant for people, not bots. A default config still works if you have no server.
+
 ---
 
 ## How it works
