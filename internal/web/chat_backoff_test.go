@@ -413,14 +413,17 @@ func TestChatPollBudgetCapsBackgroundLoop(t *testing.T) {
 	}
 }
 
-// The background budget must be able to drain a real inbox, not just a
-// message or two: FetchInbox discards everything on a deadline, so too tight a
-// budget means a backlog never drains at all.
+// The background budget must be able to drain a real inbox, not just a message
+// or two: FetchInbox discards everything on a deadline, so too tight a budget
+// means a backlog never drains at all.
+//
+// Measured against a real server over a 1.4s/query link: a 40-message inbox
+// needed 67.6s, and the 45s budget this replaced returned 0 messages on every
+// attempt. The default inbox cap is 50, so the budget has to be minutes.
 func TestChatPollBudgetCanDrainAnInbox(t *testing.T) {
-	// ~2 queries per message plus handshake, each allowed defaultTimeout, and
-	// on a degraded network a query is seconds. Minutes, not seconds.
-	if chatPollServerTimeout < 2*time.Minute {
-		t.Fatalf("background poll budget %v cannot drain a backlogged inbox",
-			chatPollServerTimeout)
+	const measuredDrain = 68 * time.Second // 40 msgs @ ~1.4s/query
+	if chatPollServerTimeout < 2*measuredDrain {
+		t.Fatalf("background poll budget %v leaves no margin over a measured %v drain",
+			chatPollServerTimeout, measuredDrain)
 	}
 }

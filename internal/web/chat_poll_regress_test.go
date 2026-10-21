@@ -87,3 +87,49 @@ func TestChatShortOutageDoesNotParkServerForHalfAnHour(t *testing.T) {
 		t.Fatalf("verified negative only waits %v", d)
 	}
 }
+
+// Closes the gap in the test above: it showed the wrong backoff VALUE, this
+// shows the consequence. A parked server is not in pollOrder, so nothing
+// polls it and nothing discovers that the network came back. pollOrder takes
+// `now`, so we can walk the clock forward through the real code.
+func TestChatParkedServerIsNotPolledUntilBackoffEnds(t *testing.T) {
+	h := newChatTestServer(t).chat
+	ps := &perServerChat{serverKey: "flaky.example.com"}
+	h.servers = map[string]*perServerChat{ps.serverKey: ps}
+	h.enabled = map[string]bool{ps.serverKey: true}
+
+	start := time.Now()
+	// ~2 minutes of bad network at the active cadence.
+	cycles := 6
+	for i := 0; i < cycles; i++ {
+		h.noteFailure(ps, errors.New("dns timeout"))
+	}
+	outage := time.Duration(cycles) * chatPollActiveInterval
+
+	inOrder := func(at time.Time) bool {
+		for _, p := range h.pollOrder(at) {
+			if p == ps {
+				return true
+			}
+		}
+		return false
+	}
+
+	if inOrder(start) {
+		t.Fatal("a server that just failed should be backed off")
+	}
+	// The network is back, but nothing polls until the backoff lapses. That
+	// silence must be comparable to the outage, not an order of magnitude more.
+	if inOrder(start.Add(chatTransientBackoffMax - time.Second)) {
+		t.Fatal("backoff ended earlier than configured")
+	}
+	if !inOrder(start.Add(chatTransientBackoffMax + time.Second)) {
+		t.Fatalf("after %v of bad network the server is still unpolled past %v: "+
+			"nothing can discover the recovery", outage, chatTransientBackoffMax)
+	}
+	// The regression this guards: with a flat 30-minute ceiling, a two-minute
+	// outage left the user in silence for half an hour.
+	if !inOrder(start.Add(10 * time.Minute)) {
+		t.Fatal("still parked 10 minutes after a 2-minute outage")
+	}
+}
