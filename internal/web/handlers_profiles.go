@@ -157,6 +157,12 @@ func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Without a re-init, chat's reset never runs, so a config added or edited
+		// in the background would get no messenger until a switch or restart.
+		if activeConfig == nil && s.chat != nil {
+			s.chat.syncServers()
+		}
+
 		// initFetcher takes s.mu — call it OUTSIDE profilesMu so handlers
 		// that need both don't AB-BA against it.
 		if activeConfig != nil {

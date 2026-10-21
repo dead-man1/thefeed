@@ -744,7 +744,11 @@ function chatRenderList(keepView) {
 
   // Status banner: distinct states (checking / pick-a-server / need-key /
   // disabled / ok).
-  if (avail === null) {
+  // Rows still being probed are not a verdict: until one lands, this is the
+  // "checking" state, not "no messenger here".
+  var stillProbing = !!(avail && !avail.available &&
+    (avail.servers || []).some(function (s) { return s.checking; }));
+  if (avail === null || stillProbing) {
     // Only show "checking…" on a fresh setup. If a server is already enabled the
     // messenger is functional (threads + address render from local state), so
     // skip the banner and let the background probe quietly refresh — no flash on
@@ -2282,6 +2286,31 @@ function chatHidePollProgress() {
   chatHideProgress('chatRecvProgress');
 }
 
+// chatMergeServerResult folds one streamed availability verdict into the list
+// and repaints whatever is on screen.
+function chatMergeServerResult(sv, limits) {
+  if (!chatState.avail) chatState.avail = { available: false, servers: [] };
+  var list = chatState.avail.servers || (chatState.avail.servers = []);
+  var row = null;
+  list.forEach(function (s) { if (s.key === sv.key) row = s; });
+  if (!row) { row = { key: sv.key, enabled: !!sv.enabled }; list.push(row); }
+  // A row the user is toggling right now owns its own state; don't fight it.
+  if (row.toggling) return;
+  row.name = sv.name || row.name;
+  row.domain = sv.domain || row.domain;
+  // enabled is NOT taken from the event: it was read when the probe STARTED,
+  // so a verdict landing after the user flipped the toggle would undo it.
+  row.checking = !!sv.checking;
+  if (sv.checking) return; // no verdict yet — leave the last one standing
+  row.available = !!sv.available;
+  row.reason = sv.reason || '';
+  if (limits) chatState.avail.limits = limits;
+  chatState.avail.available = chatUsableServers().length > 0;
+  if (!chatState.open) return;
+  if (document.querySelector('.chat-server-sheet')) chatServerSheet();
+  if (chatState.view === 'list') chatRenderList();
+}
+
 // Called by sse.js on "chat" events.
 function chatOnSSE(data) {
   if (!data || typeof data !== 'object') return;
@@ -2309,6 +2338,13 @@ function chatOnSSE(data) {
       chatShowProgress('chatSendProgress', data.done, data.total, '↑');
     }
     else if (data.op === 'poll') chatShowPollProgress(data.done, data.total);
+    return;
+  }
+  if (data.type === 'availserver' && data.server && data.server.key) {
+    // The backend answers the list before every config has been probed, then
+    // pushes each verdict as it lands — so a config that replies in a second
+    // shows up at once and a slow one is still never abandoned.
+    chatMergeServerResult(data.server, data.limits);
     return;
   }
   if (data.type === 'inboxstored') {

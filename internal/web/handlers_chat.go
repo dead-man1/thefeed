@@ -11,9 +11,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sartoopjj/thefeed/internal/client"
@@ -48,6 +50,34 @@ const (
 	chatAvailCacheTTL = 5 * time.Minute
 	// chatEnableProbeTimeout bounds the synchronous register on enable.
 	chatEnableProbeTimeout = 30 * time.Second
+	// chatAvailFirstPaint is how long GET /api/chat/availability waits before
+	// answering. It only buys a nicer first paint: probes keep running in the
+	// background and each pushes its own result over SSE as it lands. MUST stay
+	// well under the frontend's CHAT_AVAIL_TIMEOUT_MS abort, or the UI throws
+	// the response away and reports "no servers" while a working one exists.
+	chatAvailFirstPaint = 2 * time.Second
+	// chatAvailProbeTimeout is one background probe's budget. Deliberately
+	// generous: on a bad network a working config can take tens of seconds, and
+	// giving up on it would report a live server as dead.
+	chatAvailProbeTimeout = 45 * time.Second
+	// chatPollServerTimeout bounds ONE server's inbox poll in the BACKGROUND
+	// loop. Draining an inbox is tens to hundreds of sequential DNS round
+	// trips, and FetchInbox discards everything it decoded if the deadline
+	// fires, so a tight budget means a backlog can never drain at all. Servers
+	// are polled in parallel and a server already being polled is skipped, so
+	// a long budget costs nothing. The manual refresh passes its own.
+	chatPollServerTimeout = 5 * time.Minute
+	// chatPollConcurrency: servers polled at once. Independent inboxes, so they
+	// need not wait on each other; capped to stay fair to the resolver pool.
+	chatPollConcurrency = 4
+	// chatBackoffMax caps the escalating backoff for a VERIFIED negative (this
+	// server really has no messenger).
+	chatBackoffMax = 30 * time.Minute
+	// chatTransientBackoffMax caps escalation for everything else. A plain loss
+	// of connectivity must not park a healthy server for half an hour: at the
+	// 20s active cadence that would be ~100 seconds of bad network buying 30
+	// minutes of silence, with nothing polling to discover the recovery.
+	chatTransientBackoffMax = 5 * time.Minute
 	// chatEnableSyncAttempts: register tries within the synchronous window before
 	// reporting failure (background then continues to chatEnableRegisterAttempts).
 	chatEnableSyncAttempts = 5
@@ -201,15 +231,25 @@ func (th *chatThreadFile) migrateStatus() {
 // is guarded by chatHub.mu (see backedOffLocked / setBackoff).
 type perServerChat struct {
 	serverKey    string // lowercased main domain (provenance tag)
-	name         string // profile nickname (for the picker)
+	name         string // profile nickname, renamed in place (guarded by chatHub.mu)
 	domain       string
 	client       *client.ChatClient
-	f            *client.Fetcher   // its fetcher, so resolvers can be re-synced live
-	backoffUntil time.Time         // skip polling until this time (guarded by chatHub.mu)
-	lastReason   string            // i18n key of the last probe failure (guarded by chatHub.mu)
-	lastOKAt     time.Time         // last confirmed-reachable time; positive availability cache (guarded by chatHub.mu)
-	lastLimits   map[string]any    // advertised limits from the last good probe, so the cached path can still report them (guarded by chatHub.mu)
-	scorer       *chatBudgetScorer // adaptive cell-budget selection (guarded by chatHub.mu)
+	f            *client.Fetcher    // its fetcher, so resolvers can be re-synced live
+	backoffUntil time.Time          // skip polling until this time (guarded by chatHub.mu)
+	lastReason   string             // i18n key of the last probe failure (guarded by chatHub.mu)
+	lastOKAt     time.Time          // last confirmed-reachable time; positive availability cache (guarded by chatHub.mu)
+	lastLimits   map[string]any     // advertised limits from the last good probe, so the cached path can still report them (guarded by chatHub.mu)
+	failures     int                // consecutive failures, for escalating backoff (guarded by chatHub.mu)
+	pollMu       sync.Mutex         // one poll at a time for THIS server
+	scorer       *chatBudgetScorer  // adaptive cell-budget selection (guarded by chatHub.mu)
+	cfg          Config             // the config it was built from, to detect edits
+	cancel       context.CancelFunc // stops the fetcher's goroutines when dropped/replaced
+}
+
+func (ps *perServerChat) stop() {
+	if ps.cancel != nil {
+		ps.cancel()
+	}
 }
 
 // chatHub owns the web-layer chat state. Chat is multi-server: it polls and
@@ -248,8 +288,11 @@ type chatHub struct {
 	// in which each server's scorer picks a preset per send by recent success.
 	budgetMode string
 
+	// probing is the set of servers with a background availability probe in
+	// flight, so repeated list opens don't stack duplicate probes.
+	probing map[string]bool
+
 	sendMu sync.Mutex // one upload at a time (uplink is scarce)
-	pollMu sync.Mutex // one inbox poll at a time
 }
 
 func newChatHub(s *Server, dataDir string) *chatHub {
@@ -260,6 +303,7 @@ func newChatHub(s *Server, dataDir string) *chatHub {
 		contacts:   make(map[string]string),
 		threads:    make(map[string]*chatThreadFile),
 		enabled:    make(map[string]bool),
+		probing:    make(map[string]bool),
 		pollKick:   make(chan bool, 1),
 		budget:     protocol.ChatCellPlainSize, // Standard preset (fixed-mode fallback)
 		budgetMode: chatBudgetModeAuto,         // default: cost-scored adaptive pick
@@ -437,7 +481,19 @@ func (h *chatHub) reset(ctx context.Context) {
 // key (chat is fail-closed: no sk → no chat). The shared identity is reused.
 // Caller holds mu.
 func (h *chatHub) rebuildServersLocked() {
+	for _, ps := range h.servers {
+		ps.stop()
+	}
 	h.servers = make(map[string]*perServerChat)
+	h.syncServersLocked()
+}
+
+// syncServersLocked reconciles h.servers with the profiles that pin a server
+// key: new ones are added, removed or changed ones dropped/rebuilt, and the
+// rest left alone so their backoff, limits and scorer survive. Adding or
+// editing a non-active config reaches chat only through here: it doesn't
+// re-init the fetcher, so reset never runs. Caller holds mu.
+func (h *chatHub) syncServersLocked() {
 	h.activeKey = ""
 	if h.identity == nil || h.ctx == nil {
 		return
@@ -446,23 +502,49 @@ func (h *chatHub) rebuildServersLocked() {
 	if err != nil {
 		return
 	}
-	sharedResolvers := h.s.chatResolvers()
+	want := make(map[string]Profile)
+	var order []string
 	for _, p := range pl.Profiles {
 		if strings.TrimSpace(p.Config.ServerKey) == "" {
 			continue
 		}
 		key := chatServerKey(p.Config.Domain)
-		if key == "" || h.servers[key] != nil {
+		if _, dup := want[key]; key == "" || dup {
+			continue // the first profile for a server wins
+		}
+		want[key] = p
+		order = append(order, key)
+		if p.ID == pl.Active {
+			h.activeKey = key
+		}
+	}
+	for key, ps := range h.servers {
+		if p, ok := want[key]; !ok || !sameChatConfig(ps.cfg, p.Config) {
+			ps.stop()
+			delete(h.servers, key)
+		}
+	}
+	var shared []string
+	gotShared := false
+	for _, key := range order {
+		p := want[key]
+		if ps := h.servers[key]; ps != nil {
+			ps.name = p.Nickname // a rename shows up in the server picker
 			continue
+		}
+		if !gotShared {
+			shared, gotShared = h.s.chatResolvers(), true
 		}
 		// Use shared resolvers first; fall back to this profile's own
 		// resolvers so chat works even if the active config has none.
-		resolvers := sharedResolvers
+		resolvers := shared
 		if len(resolvers) == 0 {
 			resolvers = p.Config.Resolvers
 		}
-		f, ferr := h.s.buildChatFetcher(p.Config, resolvers, h.ctx)
+		ctx, cancel := context.WithCancel(h.ctx)
+		f, ferr := h.s.buildChatFetcher(p.Config, resolvers, ctx)
 		if ferr != nil {
+			cancel()
 			h.s.addLog("[chat] server " + key + ": " + ferr.Error())
 			continue
 		}
@@ -475,11 +557,26 @@ func (h *chatHub) rebuildServersLocked() {
 			client:    cc,
 			f:         f,
 			scorer:    newChatBudgetScorer(),
-		}
-		if p.ID == pl.Active {
-			h.activeKey = key
+			cfg:       p.Config,
+			cancel:    cancel,
 		}
 	}
+}
+
+// syncServers is syncServersLocked for callers that don't hold mu. Takes
+// Server.mu (read) via chatResolvers, so never call it holding Server.mu.
+func (h *chatHub) syncServers() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.syncServersLocked()
+}
+
+// sameChatConfig reports whether a server's chat client can be kept: only
+// these fields shape it (connection settings are global, resolvers shared).
+func sameChatConfig(a, b Config) bool {
+	return chatServerKey(a.Domain) == chatServerKey(b.Domain) && a.Key == b.Key &&
+		strings.TrimSpace(a.ServerKey) == strings.TrimSpace(b.ServerKey) &&
+		slices.Equal(a.ExtraDomains, b.ExtraDomains)
 }
 
 // ensureIdentityLocked creates the identity on first use, then builds the
@@ -508,6 +605,18 @@ func (h *chatHub) serverFor(key string) *perServerChat {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.servers[chatServerKey(key)]
+}
+
+// errChatPollBusy: this server is already being polled, so this cycle skips
+// it. Not a failure -- it must never count toward the backoff.
+var errChatPollBusy = errors.New("chat: poll already running for this server")
+
+// serverName reads ps.name under the lock: a profile rename mutates it in
+// place while background probes are still reading it.
+func (h *chatHub) serverName(ps *perServerChat) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return ps.name
 }
 
 // snapshotServers returns the current per-server clients.
@@ -587,7 +696,7 @@ func (h *chatHub) runPollLoop(ctx context.Context) {
 			}
 		}
 		if poll {
-			if n := h.pollAllServers(ctx, nil); n > 0 {
+			if n := h.pollAllServers(ctx, nil, chatPollServerTimeout); n > 0 {
 				h.markActivity()
 				h.s.broadcastChat(map[string]any{"type": "inbox", "got": n})
 				// Native notifier (mobile): the web UI handles foreground alerts,
@@ -658,6 +767,7 @@ func (h *chatHub) setBackoff(ps *perServerChat, until time.Time) {
 	ps.backoffUntil = until
 	if until.IsZero() {
 		ps.lastReason = "" // reachable again — drop the stale failure reason
+		ps.failures = 0
 	}
 }
 
@@ -669,6 +779,15 @@ func (h *chatHub) setProbeFailure(ps *perServerChat, until time.Time, reason str
 	defer h.mu.Unlock()
 	ps.backoffUntil = until
 	ps.lastReason = reason
+}
+
+// noteProbeFailure is setProbeFailure with the escalating backoff, so a dead
+// server stops being re-probed on every availability call.
+func (h *chatHub) noteProbeFailure(ps *perServerChat, err error, reason string) {
+	h.noteFailure(ps, err)
+	h.mu.Lock()
+	ps.lastReason = reason
+	h.mu.Unlock()
 }
 
 // probeBackoff reports whether ps is in a failure backoff window, and its last
@@ -687,6 +806,30 @@ func (h *chatHub) markReachable(ps *perServerChat) {
 	ps.backoffUntil = time.Time{}
 	ps.lastReason = ""
 	ps.lastOKAt = time.Now()
+	ps.failures = 0
+}
+
+// noteFailure records a failure and returns the new backoff deadline, doubling
+// per consecutive failure up to chatBackoffMax: one flaky round trip still
+// retries soon, a server that is gone fades out.
+func (h *chatHub) noteFailure(ps *perServerChat, err error) time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ps.failures++
+	d := chatServerBackoff(err)
+	// Only a verified "no messenger here" may escalate to the long ceiling.
+	ceiling := chatTransientBackoffMax
+	if d >= chatBackoffMax {
+		ceiling = chatBackoffMax
+	}
+	for i := 1; i < ps.failures && d < ceiling; i++ {
+		d *= 2
+	}
+	if d > ceiling {
+		d = ceiling
+	}
+	ps.backoffUntil = time.Now().Add(d)
+	return ps.backoffUntil
 }
 
 // cachedAvailable reports whether ps was confirmed reachable within the cache
@@ -763,6 +906,7 @@ func (h *chatHub) clearBackoffs() {
 	for _, ps := range h.servers {
 		ps.backoffUntil = time.Time{}
 		ps.lastReason = ""
+		ps.failures = 0
 	}
 }
 
@@ -819,7 +963,8 @@ func equalStrings(a, b []string) bool {
 
 // pollAllServers polls each non-backed-off server; a server that reports no
 // chat is backed off so we stop hammering it. Returns total new messages.
-func (h *chatHub) pollAllServers(ctx context.Context, progress client.ChatProgress) int {
+// budget caps each server's poll; 0 inherits ctx.
+func (h *chatHub) pollAllServers(ctx context.Context, progress client.ChatProgress, budget time.Duration) int {
 	h.mu.Lock()
 	idOK := h.identity != nil
 	var localAddr string
@@ -831,30 +976,117 @@ func (h *chatHub) pollAllServers(ctx context.Context, progress client.ChatProgre
 		return 0
 	}
 	h.syncResolvers() // ride the feed's current healthy resolver pool
-	now := time.Now()
-	total := 0
+
+	agg := newChatPollProgress(progress)
+	return h.pollFanOut(ctx, budget, h.pollOrder(time.Now()),
+		func(pctx context.Context, ps *perServerChat) (int, error) {
+			return h.pollServer(pctx, ps, agg.forServer(ps.serverKey), localAddr)
+		})
+}
+
+// pollFanOut polls up to chatPollConcurrency servers at once, each under its
+// own chatPollServerTimeout, and sums the new messages. Inboxes are
+// independent, so a slow server only costs its own slot.
+// budget caps each server's poll; 0 means "inherit ctx" (the manual refresh
+// already gives itself a long deadline and must be allowed to use it).
+func (h *chatHub) pollFanOut(ctx context.Context, budget time.Duration, order []*perServerChat,
+	poll func(context.Context, *perServerChat) (int, error)) int {
+
+	sema := make(chan struct{}, chatPollConcurrency)
+	var wg sync.WaitGroup
+	var total atomic.Int64
+
+	for _, ps := range order {
+		select {
+		case sema <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return int(total.Load())
+		}
+		wg.Add(1)
+		go func(ps *perServerChat) {
+			defer wg.Done()
+			defer func() { <-sema }()
+
+			pctx, cancel := ctx, context.CancelFunc(func() {})
+			if budget > 0 {
+				pctx, cancel = context.WithTimeout(ctx, budget)
+			}
+			n, err := poll(pctx, ps)
+			cancel()
+			if err != nil {
+				// Our own exit (shutdown, user navigated away) says nothing
+				// about the server -- penalising it here is how a short network
+				// outage bought 30 minutes of silence.
+				if ctx.Err() == nil && !errors.Is(err, errChatPollBusy) {
+					h.noteFailure(ps, err)
+				}
+				return
+			}
+			h.setBackoff(ps, time.Time{}) // clear backoff on success
+			total.Add(int64(n))
+		}(ps)
+	}
+	wg.Wait()
+	return int(total.Load())
+}
+
+// chatPollProgress sums the per-server poll progress into one figure, so
+// parallel polls do not make the UI bar jump between servers.
+type chatPollProgress struct {
+	out client.ChatProgress
+	mu  sync.Mutex
+	st  map[string][2]int // serverKey -> {done, total}
+}
+
+func newChatPollProgress(out client.ChatProgress) *chatPollProgress {
+	return &chatPollProgress{out: out, st: map[string][2]int{}}
+}
+
+// forServer returns a progress callback tagged with one server's key.
+func (p *chatPollProgress) forServer(key string) client.ChatProgress {
+	if p.out == nil {
+		return nil
+	}
+	return func(done, total int) {
+		p.mu.Lock()
+		p.st[key] = [2]int{done, total}
+		var d, t int
+		for _, v := range p.st {
+			d, t = d+v[0], t+v[1]
+		}
+		p.mu.Unlock()
+		p.out(d, t)
+	}
+}
+
+// pollOrder returns the servers worth polling now, healthiest first, so a
+// flaky config never takes a poll slot ahead of the one the user chats on.
+func (h *chatHub) pollOrder(now time.Time) []*perServerChat {
+	var out []*perServerChat
 	for _, ps := range h.snapshotServers() {
 		// Only poll (which opens a read session and auto-registers) servers the
 		// user has explicitly enabled — never publish the identity otherwise.
 		if !h.serverEnabled(ps.serverKey) || h.backedOff(ps, now) {
 			continue
 		}
-		n, err := h.pollServer(ctx, ps, progress, localAddr)
-		if err != nil {
-			h.setBackoff(ps, time.Now().Add(chatServerBackoff(err)))
-			continue
-		}
-		h.setBackoff(ps, time.Time{}) // clear backoff on success
-		total += n
+		out = append(out, ps)
 	}
-	return total
+	h.mu.Lock()
+	sort.SliceStable(out, func(i, j int) bool { return out[i].failures < out[j].failures })
+	h.mu.Unlock()
+	return out
 }
 
 // pollServer fetches one server's inbox, stores new messages (tagged with the
 // server), and acks them.
 func (h *chatHub) pollServer(ctx context.Context, ps *perServerChat, progress client.ChatProgress, localAddr string) (int, error) {
-	h.pollMu.Lock()
-	defer h.pollMu.Unlock()
+	// Skip, never queue: with a multi-minute budget, waiting here would stack a
+	// goroutine per cycle behind one stuck server.
+	if !ps.pollMu.TryLock() {
+		return 0, errChatPollBusy
+	}
+	defer ps.pollMu.Unlock()
 
 	msgs, err := ps.client.FetchInbox(ctx, progress)
 	if err != nil {
@@ -882,7 +1114,7 @@ func (h *chatHub) pollServer(ctx context.Context, ps *perServerChat, progress cl
 	for addr, mx := range peerMax {
 		th := h.threads[addr]
 		if th != nil && th.AckedIn[ps.serverKey] > 0 && mx <= th.AckedIn[ps.serverKey] {
-				th.resetAckedIn(ps.serverKey)
+			th.resetAckedIn(ps.serverKey)
 		}
 	}
 
@@ -1088,6 +1320,9 @@ type chatServerResult struct {
 	Enabled   bool   `json:"enabled"`
 	Cached    bool   `json:"cached,omitempty"` // reported from the positive cache, not a fresh probe
 	Reason    string `json:"reason,omitempty"`
+	// Checking means the sweep ran out of time before this server answered.
+	// No verdict, no penalty: the UI finishes it via /api/chat/probe.
+	Checking bool `json:"checking,omitempty"`
 }
 
 // chatLimitsMap renders a server's advertised limits for the UI.
@@ -1103,15 +1338,23 @@ func chatLimitsMap(l protocol.ChatLimits) map[string]any {
 // probeOneServer does a fresh DNS capability probe of one server, updating its
 // failure backoff or positive cache. Returns the row plus the server's
 // advertised limits when reachable (nil otherwise).
-func (h *chatHub) probeOneServer(ctx context.Context, ps *perServerChat, enabled bool) (chatServerResult, map[string]any) {
-	res := chatServerResult{Key: ps.serverKey, Name: ps.name, Domain: ps.domain, Enabled: enabled}
-	cctx, c := context.WithTimeout(ctx, 45*time.Second)
+// budget is this probe's own time; spending it all is a real "unreachable"
+// verdict. ctx expiring instead means the CALLER walked away, which tells us
+// nothing about the server.
+func (h *chatHub) probeOneServer(ctx context.Context, ps *perServerChat, enabled bool, budget time.Duration) (chatServerResult, map[string]any) {
+	res := chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled}
+	cctx, c := context.WithTimeout(ctx, budget)
 	defer c()
 	// Chat-availability gate, drawn from VERIFIED metadata only. The feed's
 	// regular metadata fetches cache each config's signed ChatAvailable bit
 	// (s.chatAdv); a "no chat" verdict is therefore always signature-backed —
 	// never the old unverified raw block-0 read that let fake/transient data
 	// silence a working server.
+	// cutShort: the CALLER's context ended, so we never learned anything about
+	// this server. Report "still checking" and record no failure -- only a
+	// verdict we actually got may disable a server. Our own budget running out
+	// is NOT this case: that is a genuine unreachable.
+	cutShort := func() bool { return ctx.Err() != nil }
 	advertised, fresh := h.s.chatAdvVerified(ps.serverKey)
 	if !fresh && !h.everConfirmed(ps) {
 		// Never confirmed and no fresh verified bit: fetch+verify the FULL metadata
@@ -1121,21 +1364,28 @@ func (h *chatHub) probeOneServer(ctx context.Context, ps *perServerChat, enabled
 		// already confirms it, and a verified "off" still arrives via the feed.
 		if _, err := ps.f.FetchMetadata(cctx); err == nil {
 			advertised, fresh = h.s.chatAdvVerified(ps.serverKey)
+		} else if cutShort() {
+			res.Checking = true
+			return res, nil
 		}
 	}
 	if fresh && !advertised {
 		// VERIFIED: this server advertises no messenger → disabled; re-check after
 		// the 30-min backoff (or sooner when the feed re-reads its metadata).
 		res.Reason = "chat_err_disabled"
-		h.setProbeFailure(ps, time.Now().Add(chatServerBackoff(client.ErrChatDisabled)), res.Reason)
+		h.noteProbeFailure(ps, client.ErrChatDisabled, res.Reason)
 		return res, nil
 	}
 	// Advertised, or we couldn't get a verified bit (old/unsigned server) → the
 	// authoritative, signature-verified ChatInfo probe decides (keys + limits).
 	info, err := ps.client.EnsureInfo(cctx)
 	if err != nil {
+		if cutShort() {
+			res.Checking = true
+			return res, nil
+		}
 		res.Reason = chatStatusKey(err)
-		h.setProbeFailure(ps, time.Now().Add(chatServerBackoff(err)), res.Reason)
+		h.noteProbeFailure(ps, err, res.Reason)
 		return res, nil
 	}
 	res.Available = true
@@ -1181,22 +1431,26 @@ func (s *Server) handleChatAvailability(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-	defer cancel()
-
+	// Probes run in the BACKGROUND, detached from this request: waiting for the
+	// slowest server used to hold the whole response past the frontend's abort,
+	// so the UI reported no servers while a working one existed. Each probe
+	// broadcasts its own result as it lands, so a config that answers in 1s
+	// shows up at once and one that needs 40s is still not abandoned.
+	bg := h.bgContext()
 	forced := r.URL.Query().Get("retry") == "1"
 	out := make([]chatServerResult, len(servers))
 	var (
 		wg     sync.WaitGroup
 		mu     sync.Mutex
 		limits map[string]any
+		landed = map[string]chatServerResult{} // probes that answered in time
 	)
 	now := time.Now()
 	for i, ps := range servers {
 		enabled := h.serverEnabled(ps.serverKey)
 		// Positive cache: skip the probe for a recently-reachable server (unless forced).
 		if !forced && h.cachedAvailable(ps, now) {
-			out[i] = chatServerResult{Key: ps.serverKey, Name: ps.name, Domain: ps.domain, Enabled: enabled, Available: true, Cached: true}
+			out[i] = chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Available: true, Cached: true}
 			h.mu.Lock()
 			cachedLim := ps.lastLimits
 			h.mu.Unlock()
@@ -1217,44 +1471,122 @@ func (s *Server) handleChatAvailability(w http.ResponseWriter, r *http.Request) 
 		// how a couple of stale extra configs broke chat. Enabled servers are
 		// always probed: the user opted in and wants prompt recovery.
 		if skip, reason := h.shouldSkipProbe(ps, enabled, now); skip {
-			out[i] = chatServerResult{Key: ps.serverKey, Name: ps.name, Domain: ps.domain, Enabled: enabled, Reason: reason}
+			out[i] = chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Reason: reason}
 			continue
 		}
+		// Already being probed from an earlier list open: leave the row as
+		// "checking" and let that probe's broadcast finish it.
+		if !h.beginProbe(ps.serverKey) {
+			out[i] = chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Checking: true}
+			continue
+		}
+		out[i] = chatServerResult{Key: ps.serverKey, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Checking: true}
 		wg.Add(1)
-		go func(i int, ps *perServerChat, enabled bool) {
+		go func(ps *perServerChat, enabled bool) {
 			defer wg.Done()
-			res, lim := h.probeOneServer(ctx, ps, enabled)
-			out[i] = res
-			if lim != nil {
-				mu.Lock()
-				if limits == nil {
-					limits = lim
-				}
-				mu.Unlock()
+			res, lim := h.probeOneServer(bg, ps, enabled, chatAvailProbeTimeout)
+
+			mu.Lock()
+			landed[res.Key] = res
+			if lim != nil && limits == nil {
+				limits = lim
 			}
-		}(i, ps, enabled)
+			mu.Unlock()
+
+			// Drop the claim BEFORE broadcasting: a request that still sees it
+			// held is then guaranteed the broadcast below, so no row is left
+			// spinning on "checking" with no event coming.
+			h.endProbe(ps.serverKey)
+			// Tell the UI the moment THIS server is decided, whether that took
+			// one second or forty.
+			h.broadcastServerResult(res, lim)
+		}(ps, enabled)
 	}
-	wg.Wait()
+	// Wait only for a nicer first paint; stragglers arrive over SSE.
+	waitUpTo(&wg, chatAvailFirstPaint)
+
+	mu.Lock()
+	for i := range out {
+		if res, ok := landed[out[i].Key]; ok {
+			out[i] = res
+		}
+	}
+	// Copy, never assign back: the probe goroutines outlive this handler and
+	// keep writing `limits` under mu.
+	shownLimits := limits
+	mu.Unlock()
 
 	anyUsable, firstReason := false, ""
 	for _, rr := range out {
 		if rr.Available && rr.Enabled {
 			anyUsable = true // can actually chat now: enabled AND reachable
 		}
-		if firstReason == "" && rr.Reason != "" {
+		if firstReason == "" && rr.Reason != "" && !rr.Checking {
 			firstReason = rr.Reason
 		}
 	}
 
 	resp["servers"] = out
 	resp["available"] = anyUsable
-	if limits != nil {
-		resp["limits"] = limits
+	if shownLimits != nil {
+		resp["limits"] = shownLimits
 	}
 	if !anyUsable && firstReason != "" {
 		resp["reason"] = firstReason
 	}
 	writeJSON(w, resp)
+}
+
+// bgContext returns the hub's lifetime context, so a probe outlives the HTTP
+// request that started it.
+func (h *chatHub) bgContext() context.Context {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ctx != nil {
+		return h.ctx
+	}
+	return context.Background()
+}
+
+// beginProbe claims a server for an availability probe; false means one is
+// already in flight.
+func (h *chatHub) beginProbe(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.probing[key] {
+		return false
+	}
+	if h.probing == nil {
+		h.probing = make(map[string]bool)
+	}
+	h.probing[key] = true
+	return true
+}
+
+func (h *chatHub) endProbe(key string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.probing, key)
+}
+
+// broadcastServerResult pushes one server's availability verdict to the UI so
+// each row updates as soon as that server answers.
+func (h *chatHub) broadcastServerResult(res chatServerResult, limits map[string]any) {
+	msg := map[string]any{"type": "availserver", "server": res}
+	if limits != nil {
+		msg["limits"] = limits
+	}
+	h.s.broadcastChat(msg)
+}
+
+// waitUpTo waits for wg, giving up after d (the work continues).
+func waitUpTo(wg *sync.WaitGroup, d time.Duration) {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+	}
 }
 
 // handleChatProbeServer probes ONE server (?server=KEY). The UI fires these in
@@ -1287,7 +1619,7 @@ func (s *Server) handleChatProbeServer(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	if r.URL.Query().Get("retry") != "1" && h.cachedAvailable(ps, now) {
 		resp := map[string]any{"server": chatServerResult{
-			Key: key, Name: ps.name, Domain: ps.domain, Enabled: enabled, Available: true, Cached: true,
+			Key: key, Name: h.serverName(ps), Domain: ps.domain, Enabled: enabled, Available: true, Cached: true,
 		}}
 		h.mu.Lock()
 		if ps.lastLimits != nil {
@@ -1297,9 +1629,7 @@ func (s *Server) handleChatProbeServer(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, resp)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
-	defer cancel()
-	res, lim := h.probeOneServer(ctx, ps, enabled)
+	res, lim := h.probeOneServer(r.Context(), ps, enabled, chatAvailProbeTimeout)
 	resp := map[string]any{"server": res}
 	if lim != nil {
 		resp["limits"] = lim
@@ -1864,14 +2194,13 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	hsCount := 0
-	chatc.OnHandshake = func(done, total int) {
-		hsCount++
+	var hsCount atomic.Int64
+	chatc.SetOnHandshake(func(done, total int) {
 		s.broadcastChat(map[string]any{
 			"type": "progress", "op": "handshake",
-			"done": hsCount,
+			"done": hsCount.Add(1),
 		})
-	}
+	})
 	progress := func(done, total int) {
 		s.broadcastChat(map[string]any{
 			"type": "progress", "op": "send", "peer": peerStr,
@@ -2026,16 +2355,16 @@ func (s *Server) handleChatPoll(w http.ResponseWriter, r *http.Request) {
 	h.clearBackoffs() // explicit user action — bypass stale backoffs
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
-	hsCount := 0
+	// Atomic: servers are polled in parallel, so handshakes report concurrently.
+	var hsCount atomic.Int64
 	hsProgress := func(done, total int) {
-		hsCount++
 		s.broadcastChat(map[string]any{
 			"type": "progress", "op": "handshake",
-			"done": hsCount,
+			"done": hsCount.Add(1),
 		})
 	}
 	for _, ps := range h.snapshotServers() {
-		ps.client.OnHandshake = hsProgress
+		ps.client.SetOnHandshake(hsProgress)
 	}
 	progress := func(done, total int) {
 		s.broadcastChat(map[string]any{
@@ -2043,7 +2372,9 @@ func (s *Server) handleChatPoll(w http.ResponseWriter, r *http.Request) {
 			"done": done, "total": total,
 		})
 	}
-	n := h.pollAllServers(ctx, progress)
+	// budget 0: the manual refresh already bounded itself above, and a big
+	// backlog legitimately needs minutes to drain.
+	n := h.pollAllServers(ctx, progress, 0)
 	if n > 0 {
 		h.markActivity()
 	}

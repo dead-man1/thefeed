@@ -46,7 +46,7 @@ func (s *Server) enrichSaved(it SavedItem, activeDomain string) savedItemOut {
 		return savedItemOut{SavedItem: it, ConfigLabel: it.Nickname, Available: true, IsActive: false}
 	}
 	nickname, available := s.domainInfo(it.Domain)
-	label := nickname       // current nickname of the still-imported config
+	label := nickname // current nickname of the still-imported config
 	if label == "" {
 		label = it.Nickname // snapshot from save time
 	}

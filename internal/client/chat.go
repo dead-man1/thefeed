@@ -171,8 +171,10 @@ type ChatClient struct {
 	// re-handshakes. Spacing handshakes by chatRehandshakeMinGap caps that
 	// amplification while still letting a genuine reboot/expiry recover.
 	lastHandshake time.Time
-	// OnHandshake, if set, reports handshake cell progress (done, total).
-	OnHandshake ChatProgress
+	// onHandshake, if set, reports handshake cell progress (done, total). Set
+	// it with SetOnHandshake: polls run in parallel, so the field is read from
+	// one goroutine while another is assigning it.
+	onHandshake ChatProgress
 	// budget is the per-cell op-plaintext budget B (RFC §8.2): smaller = shorter
 	// queries, more of them. The cell is self-describing by length, so the server
 	// needs no negotiation; the value is clamped to [ChatCellPlainMin, Max].
@@ -222,6 +224,21 @@ func (c *ChatClient) chunkSize() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.budget - 2
+}
+
+// SetOnHandshake sets the handshake-progress callback. Guarded: parallel polls
+// read it while the UI re-points it at a new progress sink.
+func (c *ChatClient) SetOnHandshake(p ChatProgress) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onHandshake = p
+}
+
+// onHandshakeFunc returns the current handshake-progress callback, or nil.
+func (c *ChatClient) onHandshakeFunc() ChatProgress {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.onHandshake
 }
 
 // SetBudget sets the per-cell op-plaintext budget B (clamped to the valid
@@ -557,8 +574,8 @@ func (c *ChatClient) handshake(ctx context.Context, info *protocol.ChatInfo, kin
 			if data, de := c.sendQuery(ctx, qname); de == nil {
 				last = data
 			}
-			if c.OnHandshake != nil {
-				c.OnHandshake(i+1, n)
+			if onHS := c.onHandshakeFunc(); onHS != nil {
+				onHS(i+1, n)
 			}
 		}
 		if st, body, oe := protocol.OpenChatResponse(ks, tag, protocol.ChatBootstrapCounter(), last); oe == nil {
